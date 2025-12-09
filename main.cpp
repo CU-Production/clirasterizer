@@ -629,47 +629,81 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Third Person Camera Setup
     // ========================================================================
-    // The camera orbits around a target point, always looking at it.
-    // - Yaw: horizontal angle around the target (left/right)
-    // - Pitch: vertical angle (up/down)
-    // - Distance: how far the camera is from the target
-    // - Target offset: vertical offset of the look-at point
+    // Free camera with position and orientation
+    // - WASD: Move forward/backward/left/right (relative to camera direction)
+    // - QE: Move up/down
+    // - Arrow keys: Look around (yaw/pitch)
+    // - R: Reset camera
     
     // Camera control constants
-    constexpr float CAM_YAW_SPEED = 0.08f;
-    constexpr float CAM_PITCH_SPEED = 0.06f;
-    constexpr float CAM_ZOOM_SPEED = 0.15f;
-    constexpr float CAM_HEIGHT_SPEED = 0.1f;
-    constexpr float CAM_PITCH_MIN = -1.3f;
-    constexpr float CAM_PITCH_MAX = 1.3f;
-    constexpr float CAM_DIST_MIN = 0.01f;
-    constexpr float CAM_DIST_MAX = 8.0f;
-    constexpr float CAM_HEIGHT_MIN = -1.5f;
-    constexpr float CAM_HEIGHT_MAX = 1.5f;
+    constexpr float CAM_MOVE_SPEED = 0.15f;    // Movement speed
+    constexpr float CAM_ROTATE_SPEED = 0.06f;  // Rotation speed (radians)
     
     // Camera state
-    struct {
-        float yaw = 0.0f;              // Horizontal angle (radians)
-        float pitch = 0.3f;            // Vertical angle (radians)
-        float distance = 2.5f;         // Distance from target
-        float target_height = 0.0f;    // Vertical offset of target point
+    struct Camera {
+        HMM_Vec3 position = HMM_V3(0.0f, 1.0f, 3.0f);  // Camera position
+        float yaw = 0.0f;                               // Horizontal angle (radians), 0 = looking at -Z
+        float pitch = 0.0f;                             // Vertical angle (radians)
         
-        // Calculate camera position in world space
-        HMM_Vec3 get_position() const {
-            float x = distance * std::cos(pitch) * std::sin(yaw);
-            float y = distance * std::sin(pitch) + target_height;
-            float z = distance * std::cos(pitch) * std::cos(yaw);
-            return HMM_V3(x, y, z);
+        // Get forward direction (where camera is looking, in XZ plane)
+        HMM_Vec3 get_forward() const {
+            return HMM_V3(
+                -std::sin(yaw),
+                0.0f,
+                -std::cos(yaw)
+            );
         }
         
-        // Get the target point the camera looks at
-        HMM_Vec3 get_target() const {
-            return HMM_V3(0.0f, target_height, 0.0f);
+        // Get right direction
+        HMM_Vec3 get_right() const {
+            return HMM_V3(
+                std::cos(yaw),
+                0.0f,
+                -std::sin(yaw)
+            );
+        }
+        
+        // Get look direction (includes pitch)
+        HMM_Vec3 get_look_direction() const {
+            return HMM_V3(
+                -std::sin(yaw) * std::cos(pitch),
+                std::sin(pitch),
+                -std::cos(yaw) * std::cos(pitch)
+            );
+        }
+        
+        // Movement functions
+        void move_forward(float amount) {
+            position = HMM_AddV3(position, HMM_MulV3F(get_forward(), amount));
+        }
+        
+        void move_right(float amount) {
+            position = HMM_AddV3(position, HMM_MulV3F(get_right(), amount));
+        }
+        
+        void move_up(float amount) {
+            position.Y += amount;
+        }
+        
+        void rotate_yaw(float amount) {
+            yaw += amount;
+        }
+        
+        void rotate_pitch(float amount) {
+            // Pitch limits: -1.4f to 1.4f (approx ±80 degrees)
+            pitch = std::clamp(pitch + amount, -1.4f, 1.4f);
         }
         
         // Build view matrix
         HMM_Mat4 get_view_matrix() const {
-            return HMM_LookAt_RH(get_position(), get_target(), HMM_V3(0, 1, 0));
+            HMM_Vec3 target = HMM_AddV3(position, get_look_direction());
+            return HMM_LookAt_RH(position, target, HMM_V3(0, 1, 0));
+        }
+        
+        void reset() {
+            position = HMM_V3(0.0f, 1.0f, 3.0f);
+            yaw = 0.0f;
+            pitch = 0.0f;
         }
     } camera;
     
@@ -757,65 +791,74 @@ int main(int argc, char* argv[]) {
             int ch = get_char();
             switch (ch) {
                 // ============================================================
-                // Camera Orbit Controls (Third Person Camera)
+                // Camera Movement (WASD + QE)
                 // ============================================================
                 
-                // Orbit horizontally (A/D - rotate around target)
-                case 'a':
-                case 'A':
-                    camera.yaw -= CAM_YAW_SPEED;
-                    break;
-                case 'd':
-                case 'D':
-                    camera.yaw += CAM_YAW_SPEED;
-                    break;
-                
-                // Orbit vertically (W/S - look up/down)
+                // Move forward/backward
                 case 'w':
                 case 'W':
-                    camera.pitch = std::min(camera.pitch + CAM_PITCH_SPEED, CAM_PITCH_MAX);
+                    camera.move_forward(CAM_MOVE_SPEED);
                     break;
                 case 's':
                 case 'S':
-                    camera.pitch = std::max(camera.pitch - CAM_PITCH_SPEED, CAM_PITCH_MIN);
+                    camera.move_forward(-CAM_MOVE_SPEED);
                     break;
                 
-                // Zoom (Q/E or +/-)
+                // Move left/right (strafe)
+                case 'a':
+                case 'A':
+                    camera.move_right(-CAM_MOVE_SPEED);
+                    break;
+                case 'd':
+                case 'D':
+                    camera.move_right(CAM_MOVE_SPEED);
+                    break;
+                
+                // Move up/down
                 case 'q':
                 case 'Q':
-                case '-':
-                case '_':
-                    camera.distance = std::min(camera.distance + CAM_ZOOM_SPEED, CAM_DIST_MAX);
+                    camera.move_up(-CAM_MOVE_SPEED);
                     break;
                 case 'e':
                 case 'E':
-                case '+':
-                case '=':
-                    camera.distance = std::max(camera.distance - CAM_ZOOM_SPEED, CAM_DIST_MIN);
+                    camera.move_up(CAM_MOVE_SPEED);
                     break;
                 
-                // Move target point up/down (Shift look point)
-                case 'z':
-                case 'Z':
-                    camera.target_height = std::max(camera.target_height - CAM_HEIGHT_SPEED, CAM_HEIGHT_MIN);
+                // ============================================================
+                // Camera Rotation (Arrow keys or IJKL)
+                // ============================================================
+                
+                // Look left/right (yaw)
+                case 'j':
+                case 'J':
+                    camera.rotate_yaw(-CAM_ROTATE_SPEED);
                     break;
-                case 'x':
-                case 'X':
-                    camera.target_height = std::min(camera.target_height + CAM_HEIGHT_SPEED, CAM_HEIGHT_MAX);
+                case 'l':
+                case 'L':
+                    camera.rotate_yaw(CAM_ROTATE_SPEED);
                     break;
+                
+                // Look up/down (pitch)
+                case 'i':
+                case 'I':
+                    camera.rotate_pitch(CAM_ROTATE_SPEED);
+                    break;
+                case 'k':
+                case 'K':
+                    camera.rotate_pitch(-CAM_ROTATE_SPEED);
+                    break;
+                
+                // ============================================================
+                // Other Controls
+                // ============================================================
                 
                 // Reset camera to default position
                 case 'r':
                 case 'R':
-                    camera.yaw = 0.0f;
-                    camera.pitch = 0.3f;
-                    camera.distance = 2.5f;
-                    camera.target_height = 0.0f;
+                    camera.reset();
                     break;
                 
-                // ============================================================
                 // Screenshot
-                // ============================================================
                 case 'p':
                 case 'P': {
                     char filename[64];
@@ -849,10 +892,10 @@ int main(int argc, char* argv[]) {
         std::cout << "FPS: " << static_cast<int>(fps) 
                   << "  Res: " << screen_width << "x" << pixel_height
                   << std::fixed << std::setprecision(1)
-                  << "  Dist: " << camera.distance;
+                  << "  Pos: (" << camera.position.X << ", " << camera.position.Y << ", " << camera.position.Z << ")";
         
         std::cout << "\033[" << (status_row + 1) << ";1H\033[K";
-        std::cout << "[WASD] Orbit  [QE] Zoom  [ZX] Height  [R] Reset  [P] Screenshot" << std::flush;
+        std::cout << "[WASD] Move  [QE] Up/Down  [IJKL] Look  [R] Reset  [P] Screenshot" << std::flush;
     }
     
     TerminalRenderer::cleanup();
