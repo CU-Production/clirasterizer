@@ -69,7 +69,7 @@ inline int get_char() { return getchar(); }
 // ============================================================================
 
 constexpr int SCREEN_WIDTH = 120;
-constexpr int SCREEN_HEIGHT = 60;  // Actual pixel height = SCREEN_HEIGHT * 2
+constexpr int SCREEN_HEIGHT = 30;  // Actual pixel height = SCREEN_HEIGHT * 2
 
 // ============================================================================
 // Color structure
@@ -464,7 +464,8 @@ public:
                 snprintf(buf, sizeof(buf), "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm",
                          top.r, top.g, top.b, bottom.r, bottom.g, bottom.b);
                 output += buf;
-                output += "\xE2\x96\x80";  // UTF-8 encoding of "▀" (U+2580)
+                // output += "\xE2\x96\x80";  // UTF-8 encoding of "▀" (U+2580)
+                output += "T";  // UTF-8 encoding of "▀" (U+2580)
             }
             output += "\033[0m\n";  // Reset colors and newline
         }
@@ -527,20 +528,52 @@ int main(int argc, char* argv[]) {
     float aspect = static_cast<float>(SCREEN_WIDTH) / (SCREEN_HEIGHT * 2);
     HMM_Mat4 projection = HMM_Perspective_RH_NO(HMM_AngleDeg(45.0f), aspect, 0.1f, 100.0f);
     
-    // Camera setup - spherical coordinates (yaw, pitch, distance)
-    float camera_yaw = 0.0f;        // Horizontal rotation (radians)
-    float camera_pitch = 0.2f;      // Vertical rotation (radians), slightly above
-    float camera_distance = 2.5f;   // Distance from origin
-    bool auto_rotate = true;        // Auto rotation toggle
-    float model_rotation = 0.0f;    // Manual model rotation when auto_rotate is off
+    // ========================================================================
+    // Third Person Camera Setup
+    // ========================================================================
+    // The camera orbits around a target point, always looking at it.
+    // - Yaw: horizontal angle around the target (left/right)
+    // - Pitch: vertical angle (up/down)
+    // - Distance: how far the camera is from the target
+    // - Target offset: vertical offset of the look-at point
     
-    // Camera control speed
-    constexpr float ROTATE_SPEED = 0.1f;
-    constexpr float ZOOM_SPEED = 0.2f;
-    constexpr float PITCH_MIN = -1.4f;  // Prevent gimbal lock
-    constexpr float PITCH_MAX = 1.4f;
-    constexpr float DIST_MIN = 0.5f;
-    constexpr float DIST_MAX = 10.0f;
+    // Camera control constants
+    constexpr float CAM_YAW_SPEED = 0.08f;
+    constexpr float CAM_PITCH_SPEED = 0.06f;
+    constexpr float CAM_ZOOM_SPEED = 0.15f;
+    constexpr float CAM_HEIGHT_SPEED = 0.1f;
+    constexpr float CAM_PITCH_MIN = -1.3f;
+    constexpr float CAM_PITCH_MAX = 1.3f;
+    constexpr float CAM_DIST_MIN = 0.01f;
+    constexpr float CAM_DIST_MAX = 8.0f;
+    constexpr float CAM_HEIGHT_MIN = -1.5f;
+    constexpr float CAM_HEIGHT_MAX = 1.5f;
+    
+    // Camera state
+    struct {
+        float yaw = 0.0f;              // Horizontal angle (radians)
+        float pitch = 0.3f;            // Vertical angle (radians)
+        float distance = 2.5f;         // Distance from target
+        float target_height = 0.0f;    // Vertical offset of target point
+        
+        // Calculate camera position in world space
+        HMM_Vec3 get_position() const {
+            float x = distance * std::cos(pitch) * std::sin(yaw);
+            float y = distance * std::sin(pitch) + target_height;
+            float z = distance * std::cos(pitch) * std::cos(yaw);
+            return HMM_V3(x, y, z);
+        }
+        
+        // Get the target point the camera looks at
+        HMM_Vec3 get_target() const {
+            return HMM_V3(0.0f, target_height, 0.0f);
+        }
+        
+        // Build view matrix
+        HMM_Mat4 get_view_matrix() const {
+            return HMM_LookAt_RH(get_position(), get_target(), HMM_V3(0, 1, 0));
+        }
+    } camera;
     
     // Initialize terminal
     TerminalRenderer::init();
@@ -549,39 +582,22 @@ int main(int argc, char* argv[]) {
     
     // Animation loop
     auto start_time = std::chrono::high_resolution_clock::now();
-    auto last_time = start_time;
     
     while (true) {
         auto current_time = std::chrono::high_resolution_clock::now();
         float elapsed = std::chrono::duration<float>(current_time - start_time).count();
-        (void)last_time;  // Reserved for future delta-time based controls
-        last_time = current_time;
-        
-        // Auto rotation
-        if (auto_rotate) {
-            model_rotation = elapsed * 0.5f;  // Rotation speed
-        }
+        (void)elapsed;  // Available for animations if needed
         
         // Clear framebuffer
         fb.clear();
         
-        // Build model matrix: center mesh, scale to unit size, rotate
+        // Build model matrix: center mesh and scale to unit size (no rotation - camera orbits instead)
         HMM_Mat4 model = HMM_M4D(1.0f);
-        model = HMM_MulM4(model, HMM_Rotate_RH(model_rotation, HMM_V3(0, 1, 0)));  // Rotate around Y
         model = HMM_MulM4(model, HMM_Scale(HMM_V3(2.0f / mesh_scale, 2.0f / mesh_scale, 2.0f / mesh_scale)));
         model = HMM_MulM4(model, HMM_Translate(HMM_V3(-mesh_center.X, -mesh_center.Y, -mesh_center.Z)));
         
-        // Calculate camera position from spherical coordinates
-        float cam_x = camera_distance * std::cos(camera_pitch) * std::sin(camera_yaw);
-        float cam_y = camera_distance * std::sin(camera_pitch);
-        float cam_z = camera_distance * std::cos(camera_pitch) * std::cos(camera_yaw);
-        
-        // View matrix (camera looking at origin)
-        HMM_Mat4 view = HMM_LookAt_RH(
-            HMM_V3(cam_x, cam_y, cam_z),  // Camera position (spherical)
-            HMM_V3(0, 0, 0),               // Look at origin
-            HMM_V3(0, 1, 0)                // Up vector
-        );
+        // Get view matrix from third person camera
+        HMM_Mat4 view = camera.get_view_matrix();
         
         // Combined MVP matrix
         HMM_Mat4 mvp = HMM_MulM4(projection, HMM_MulM4(view, model));
@@ -622,7 +638,66 @@ int main(int argc, char* argv[]) {
         while (keyboard_hit()) {
             int ch = get_char();
             switch (ch) {
+                // ============================================================
+                // Camera Orbit Controls (Third Person Camera)
+                // ============================================================
+                
+                // Orbit horizontally (A/D - rotate around target)
+                case 'a':
+                case 'A':
+                    camera.yaw -= CAM_YAW_SPEED;
+                    break;
+                case 'd':
+                case 'D':
+                    camera.yaw += CAM_YAW_SPEED;
+                    break;
+                
+                // Orbit vertically (W/S - look up/down)
+                case 'w':
+                case 'W':
+                    camera.pitch = std::min(camera.pitch + CAM_PITCH_SPEED, CAM_PITCH_MAX);
+                    break;
+                case 's':
+                case 'S':
+                    camera.pitch = std::max(camera.pitch - CAM_PITCH_SPEED, CAM_PITCH_MIN);
+                    break;
+                
+                // Zoom (Q/E or +/-)
+                case 'q':
+                case 'Q':
+                case '-':
+                case '_':
+                    camera.distance = std::min(camera.distance + CAM_ZOOM_SPEED, CAM_DIST_MAX);
+                    break;
+                case 'e':
+                case 'E':
+                case '+':
+                case '=':
+                    camera.distance = std::max(camera.distance - CAM_ZOOM_SPEED, CAM_DIST_MIN);
+                    break;
+                
+                // Move target point up/down (Shift look point)
+                case 'z':
+                case 'Z':
+                    camera.target_height = std::max(camera.target_height - CAM_HEIGHT_SPEED, CAM_HEIGHT_MIN);
+                    break;
+                case 'x':
+                case 'X':
+                    camera.target_height = std::min(camera.target_height + CAM_HEIGHT_SPEED, CAM_HEIGHT_MAX);
+                    break;
+                
+                // Reset camera to default position
+                case 'r':
+                case 'R':
+                    camera.yaw = 0.0f;
+                    camera.pitch = 0.3f;
+                    camera.distance = 2.5f;
+                    camera.target_height = 0.0f;
+                    break;
+                
+                // ============================================================
                 // Screenshot
+                // ============================================================
                 case 'p':
                 case 'P': {
                     char filename[64];
@@ -634,67 +709,6 @@ int main(int argc, char* argv[]) {
                     }
                     break;
                 }
-                
-                // Camera rotation (yaw)
-                case 'a':
-                case 'A':
-                    camera_yaw -= ROTATE_SPEED;
-                    break;
-                case 'd':
-                case 'D':
-                    camera_yaw += ROTATE_SPEED;
-                    break;
-                
-                // Camera pitch
-                case 'w':
-                case 'W':
-                    camera_pitch = std::min(camera_pitch + ROTATE_SPEED, PITCH_MAX);
-                    break;
-                case 's':
-                case 'S':
-                    camera_pitch = std::max(camera_pitch - ROTATE_SPEED, PITCH_MIN);
-                    break;
-                
-                // Camera zoom
-                case 'q':
-                case 'Q':
-                case '-':
-                case '_':
-                    camera_distance = std::min(camera_distance + ZOOM_SPEED, DIST_MAX);
-                    break;
-                case 'e':
-                case 'E':
-                case '+':
-                case '=':
-                    camera_distance = std::max(camera_distance - ZOOM_SPEED, DIST_MIN);
-                    break;
-                
-                // Toggle auto rotation
-                case ' ':
-                    auto_rotate = !auto_rotate;
-                    if (!auto_rotate) {
-                        model_rotation = elapsed * 0.5f;  // Freeze at current angle
-                    }
-                    break;
-                
-                // Manual model rotation (when auto_rotate is off)
-                case 'j':
-                case 'J':
-                    if (!auto_rotate) model_rotation -= ROTATE_SPEED;
-                    break;
-                case 'l':
-                case 'L':
-                    if (!auto_rotate) model_rotation += ROTATE_SPEED;
-                    break;
-                
-                // Reset camera
-                case 'r':
-                case 'R':
-                    camera_yaw = 0.0f;
-                    camera_pitch = 0.2f;
-                    camera_distance = 2.5f;
-                    auto_rotate = true;
-                    break;
             }
         }
         
@@ -715,11 +729,12 @@ int main(int argc, char* argv[]) {
         std::cout << "\033[" << (SCREEN_HEIGHT + 2) << ";1H\033[K";
         std::cout << "FPS: " << static_cast<int>(fps) 
                   << "  Verts: " << mesh.vertices.size()
-                  << "  Dist: " << std::fixed << std::setprecision(1) << camera_distance
-                  << "  Auto: " << (auto_rotate ? "ON" : "OFF");
+                  << std::fixed << std::setprecision(1)
+                  << "  Dist: " << camera.distance
+                  << "  Height: " << camera.target_height;
         
         std::cout << "\033[" << (SCREEN_HEIGHT + 3) << ";1H\033[K";
-        std::cout << "[WASD] Camera  [QE] Zoom  [Space] Auto  [JL] Rotate  [R] Reset  [P] Screenshot" << std::flush;
+        std::cout << "[WASD] Orbit  [QE] Zoom  [ZX] Height  [R] Reset  [P] Screenshot" << std::flush;
     }
     
     TerminalRenderer::cleanup();
