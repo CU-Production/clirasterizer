@@ -10,7 +10,9 @@
 #include <cstring>
 
 #ifdef _WIN32
+#define NOMINMAX  // Prevent windows.h from defining min/max macros
 #include <conio.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #include <termios.h>
@@ -464,8 +466,7 @@ public:
                 snprintf(buf, sizeof(buf), "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm",
                          top.r, top.g, top.b, bottom.r, bottom.g, bottom.b);
                 output += buf;
-                // output += "\xE2\x96\x80";  // UTF-8 encoding of "▀" (U+2580)
-                output += "T";  // UTF-8 encoding of "▀" (U+2580)
+                output += "\xE2\x96\x80";  // UTF-8 encoding of "▀" (U+2580)
             }
             output += "\033[0m\n";  // Reset colors and newline
         }
@@ -475,6 +476,18 @@ public:
     
     // Clear screen and hide cursor
     static void init() {
+#ifdef _WIN32
+        // Set console to UTF-8 code page
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        
+        // Enable virtual terminal processing for ANSI escape sequences
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD dwMode = 0;
+        GetConsoleMode(hOut, &dwMode);
+        dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hOut, dwMode);
+#endif
         std::cout << "\033[2J";     // Clear screen
         std::cout << "\033[?25l";   // Hide cursor
         std::cout << std::flush;

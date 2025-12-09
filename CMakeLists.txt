@@ -8,7 +8,6 @@ add_subdirectory(3rd_party)
 # Set UTF-8 encoding support
 if(MSVC)
     add_compile_options(/utf-8)
-    add_definitions(-DNOMINMAX)
 else()
     add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
 endif()
