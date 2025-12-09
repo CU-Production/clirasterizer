@@ -29,6 +29,9 @@
 #include "stb_image_write.h"
 
 #include "HandmadeMath.h"
+#include "parallel-util.hpp"
+#include <atomic>
+#include <memory>
 
 // ============================================================================
 // Platform-specific keyboard input
@@ -131,32 +134,60 @@ struct Color {
 };
 
 // ============================================================================
-// Framebuffer - stores color and depth for each pixel
+// Framebuffer - stores color and depth for each pixel (thread-safe)
 // ============================================================================
+
+// Helper: convert float to uint32 for atomic comparison (preserves order)
+inline uint32_t float_to_uint32(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    // Handle sign bit to preserve ordering: flip all bits for negative, flip sign bit for positive
+    if (u & 0x80000000) {
+        return ~u;  // Negative: flip all bits
+    } else {
+        return u ^ 0x80000000;  // Positive: flip sign bit
+    }
+}
 
 class Framebuffer {
 public:
     int width, height;
     std::vector<Color> color_buffer;
-    std::vector<float> depth_buffer;
+    std::unique_ptr<std::atomic<uint32_t>[]> depth_buffer;  // Atomic array for thread-safe depth test
     
     Framebuffer(int w, int h) : width(w), height(h) {
         color_buffer.resize(w * h);
-        depth_buffer.resize(w * h);
+        depth_buffer = std::make_unique<std::atomic<uint32_t>[]>(w * h);
         clear();
     }
     
     void clear() {
-        std::fill(color_buffer.begin(), color_buffer.end(), Color(20, 20, 30));
-        std::fill(depth_buffer.begin(), depth_buffer.end(), std::numeric_limits<float>::max());
+        Color bg_color(20, 20, 30);
+        uint32_t max_depth = float_to_uint32(std::numeric_limits<float>::max());
+        
+        // Parallel clear for better performance
+        parallelutil::parallel_for(width * height, [&](int i) {
+            color_buffer[i] = bg_color;
+            depth_buffer[i].store(max_depth, std::memory_order_relaxed);
+        });
     }
     
+    // Thread-safe pixel write with atomic depth test
     void set_pixel(int x, int y, const Color& color, float depth) {
         if (x < 0 || x >= width || y < 0 || y >= height) return;
         int idx = y * width + x;
-        if (depth < depth_buffer[idx]) {
-            depth_buffer[idx] = depth;
-            color_buffer[idx] = color;
+        
+        uint32_t new_depth = float_to_uint32(depth);
+        uint32_t old_depth = depth_buffer[idx].load(std::memory_order_relaxed);
+        
+        // Atomic compare-and-swap loop for depth test
+        while (new_depth < old_depth) {
+            if (depth_buffer[idx].compare_exchange_weak(old_depth, new_depth,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                color_buffer[idx] = color;  // Won the race, write color
+                break;
+            }
+            // CAS failed, old_depth updated, retry if still closer
         }
     }
     
@@ -183,7 +214,7 @@ public:
         width = new_width;
         height = new_height;
         color_buffer.resize(width * height);
-        depth_buffer.resize(width * height);
+        depth_buffer = std::make_unique<std::atomic<uint32_t>[]>(width * height);
         clear();
     }
 };
@@ -690,8 +721,10 @@ int main(int argc, char* argv[]) {
         // Normal matrix (for lighting)
         HMM_Mat4 model_view = HMM_MulM4(view, model);
         
-        // Render all triangles
-        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+        // Render all triangles in parallel
+        int num_triangles = static_cast<int>(mesh.indices.size() / 3);
+        parallelutil::parallel_for(num_triangles, [&](int tri_idx) {
+            size_t i = tri_idx * 3;
             std::array<HMM_Vec4, 3> clip_verts;
             std::array<HMM_Vec2, 3> texcoords;
             std::array<HMM_Vec3, 3> normals;
@@ -713,7 +746,7 @@ int main(int argc, char* argv[]) {
             }
             
             rasterizer.draw_triangle(clip_verts, texcoords, normals);
-        }
+        });
         
         // Render to terminal
         TerminalRenderer::render(fb);
