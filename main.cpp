@@ -889,7 +889,8 @@ int main(int argc, char* argv[]) {
         // Print status at bottom
         int status_row = screen_height + 2;
         std::cout << "\033[" << status_row << ";1H\033[K";
-        std::cout << "FPS: " << static_cast<int>(fps) 
+        std::cout << "FPS: " << static_cast<int>(fps)
+                  << "  Vertices: " << mesh.vertices.size()
                   << "  Res: " << screen_width << "x" << pixel_height
                   << std::fixed << std::setprecision(1)
                   << "  Pos: (" << camera.position.X << ", " << camera.position.Y << ", " << camera.position.Z << ")";
