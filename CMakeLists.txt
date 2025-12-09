@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_subdirectory(3rd_party)
 
+# Set UTF-8 encoding support
+if(MSVC)
+    add_compile_options(/utf-8)
+    add_definitions(-DNOMINMAX)
+else()
+    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
+endif()
+
 add_executable(clirasterizer main.cpp)
 target_link_libraries(clirasterizer PRIVATE hmm parallel_util stb tinyobjloader)
 add_custom_command(TARGET clirasterizer POST_BUILD
