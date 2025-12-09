@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -526,8 +527,20 @@ int main(int argc, char* argv[]) {
     float aspect = static_cast<float>(SCREEN_WIDTH) / (SCREEN_HEIGHT * 2);
     HMM_Mat4 projection = HMM_Perspective_RH_NO(HMM_AngleDeg(45.0f), aspect, 0.1f, 100.0f);
     
-    // Camera setup
-    float camera_distance = 2.5f;
+    // Camera setup - spherical coordinates (yaw, pitch, distance)
+    float camera_yaw = 0.0f;        // Horizontal rotation (radians)
+    float camera_pitch = 0.2f;      // Vertical rotation (radians), slightly above
+    float camera_distance = 2.5f;   // Distance from origin
+    bool auto_rotate = true;        // Auto rotation toggle
+    float model_rotation = 0.0f;    // Manual model rotation when auto_rotate is off
+    
+    // Camera control speed
+    constexpr float ROTATE_SPEED = 0.1f;
+    constexpr float ZOOM_SPEED = 0.2f;
+    constexpr float PITCH_MIN = -1.4f;  // Prevent gimbal lock
+    constexpr float PITCH_MAX = 1.4f;
+    constexpr float DIST_MIN = 0.5f;
+    constexpr float DIST_MAX = 10.0f;
     
     // Initialize terminal
     TerminalRenderer::init();
@@ -535,28 +548,39 @@ int main(int argc, char* argv[]) {
     std::cout << "Press Ctrl+C to exit..." << std::endl;
     
     // Animation loop
-    float angle = 0.0f;
     auto start_time = std::chrono::high_resolution_clock::now();
+    auto last_time = start_time;
     
     while (true) {
         auto current_time = std::chrono::high_resolution_clock::now();
         float elapsed = std::chrono::duration<float>(current_time - start_time).count();
-        angle = elapsed * 0.5f;  // Rotation speed
+        (void)last_time;  // Reserved for future delta-time based controls
+        last_time = current_time;
+        
+        // Auto rotation
+        if (auto_rotate) {
+            model_rotation = elapsed * 0.5f;  // Rotation speed
+        }
         
         // Clear framebuffer
         fb.clear();
         
         // Build model matrix: center mesh, scale to unit size, rotate
         HMM_Mat4 model = HMM_M4D(1.0f);
-        model = HMM_MulM4(model, HMM_Rotate_RH(angle, HMM_V3(0, 1, 0)));  // Rotate around Y
+        model = HMM_MulM4(model, HMM_Rotate_RH(model_rotation, HMM_V3(0, 1, 0)));  // Rotate around Y
         model = HMM_MulM4(model, HMM_Scale(HMM_V3(2.0f / mesh_scale, 2.0f / mesh_scale, 2.0f / mesh_scale)));
         model = HMM_MulM4(model, HMM_Translate(HMM_V3(-mesh_center.X, -mesh_center.Y, -mesh_center.Z)));
         
+        // Calculate camera position from spherical coordinates
+        float cam_x = camera_distance * std::cos(camera_pitch) * std::sin(camera_yaw);
+        float cam_y = camera_distance * std::sin(camera_pitch);
+        float cam_z = camera_distance * std::cos(camera_pitch) * std::cos(camera_yaw);
+        
         // View matrix (camera looking at origin)
         HMM_Mat4 view = HMM_LookAt_RH(
-            HMM_V3(0, 0.5f, camera_distance),  // Camera position
-            HMM_V3(0, 0, 0),                    // Look at origin
-            HMM_V3(0, 1, 0)                     // Up vector
+            HMM_V3(cam_x, cam_y, cam_z),  // Camera position (spherical)
+            HMM_V3(0, 0, 0),               // Look at origin
+            HMM_V3(0, 1, 0)                // Up vector
         );
         
         // Combined MVP matrix
@@ -593,18 +617,84 @@ int main(int argc, char* argv[]) {
         // Render to terminal
         TerminalRenderer::render(fb);
         
-        // Check for keyboard input - Press 'P' to save screenshot
+        // Check for keyboard input
         static int screenshot_count = 0;
-        if (keyboard_hit()) {
+        while (keyboard_hit()) {
             int ch = get_char();
-            if (ch == 'p' || ch == 'P') {
-                char filename[64];
-                snprintf(filename, sizeof(filename), "screenshot_%03d.png", screenshot_count++);
-                if (fb.save_to_file(filename)) {
-                    std::cout << "\033[" << (SCREEN_HEIGHT + 3) << ";1H";
-                    std::cout << "\033[K";  // Clear line
-                    std::cout << "Saved: " << filename << std::flush;
+            switch (ch) {
+                // Screenshot
+                case 'p':
+                case 'P': {
+                    char filename[64];
+                    snprintf(filename, sizeof(filename), "screenshot_%03d.png", screenshot_count++);
+                    if (fb.save_to_file(filename)) {
+                        std::cout << "\033[" << (SCREEN_HEIGHT + 4) << ";1H";
+                        std::cout << "\033[K";  // Clear line
+                        std::cout << "Saved: " << filename << std::flush;
+                    }
+                    break;
                 }
+                
+                // Camera rotation (yaw)
+                case 'a':
+                case 'A':
+                    camera_yaw -= ROTATE_SPEED;
+                    break;
+                case 'd':
+                case 'D':
+                    camera_yaw += ROTATE_SPEED;
+                    break;
+                
+                // Camera pitch
+                case 'w':
+                case 'W':
+                    camera_pitch = std::min(camera_pitch + ROTATE_SPEED, PITCH_MAX);
+                    break;
+                case 's':
+                case 'S':
+                    camera_pitch = std::max(camera_pitch - ROTATE_SPEED, PITCH_MIN);
+                    break;
+                
+                // Camera zoom
+                case 'q':
+                case 'Q':
+                case '-':
+                case '_':
+                    camera_distance = std::min(camera_distance + ZOOM_SPEED, DIST_MAX);
+                    break;
+                case 'e':
+                case 'E':
+                case '+':
+                case '=':
+                    camera_distance = std::max(camera_distance - ZOOM_SPEED, DIST_MIN);
+                    break;
+                
+                // Toggle auto rotation
+                case ' ':
+                    auto_rotate = !auto_rotate;
+                    if (!auto_rotate) {
+                        model_rotation = elapsed * 0.5f;  // Freeze at current angle
+                    }
+                    break;
+                
+                // Manual model rotation (when auto_rotate is off)
+                case 'j':
+                case 'J':
+                    if (!auto_rotate) model_rotation -= ROTATE_SPEED;
+                    break;
+                case 'l':
+                case 'L':
+                    if (!auto_rotate) model_rotation += ROTATE_SPEED;
+                    break;
+                
+                // Reset camera
+                case 'r':
+                case 'R':
+                    camera_yaw = 0.0f;
+                    camera_pitch = 0.2f;
+                    camera_distance = 2.5f;
+                    auto_rotate = true;
+                    break;
             }
         }
         
@@ -621,10 +711,15 @@ int main(int argc, char* argv[]) {
             fps_timer = elapsed;
         }
         
-        // Print FPS at bottom
-        std::cout << "\033[" << (SCREEN_HEIGHT + 2) << ";1H";
-        std::cout << "FPS: " << static_cast<int>(fps) << "  Vertices: " << mesh.vertices.size();
-        std::cout << "  [P] Screenshot  [Ctrl+C] Exit" << std::flush;
+        // Print status at bottom
+        std::cout << "\033[" << (SCREEN_HEIGHT + 2) << ";1H\033[K";
+        std::cout << "FPS: " << static_cast<int>(fps) 
+                  << "  Verts: " << mesh.vertices.size()
+                  << "  Dist: " << std::fixed << std::setprecision(1) << camera_distance
+                  << "  Auto: " << (auto_rotate ? "ON" : "OFF");
+        
+        std::cout << "\033[" << (SCREEN_HEIGHT + 3) << ";1H\033[K";
+        std::cout << "[WASD] Camera  [QE] Zoom  [Space] Auto  [JL] Rotate  [R] Reset  [P] Screenshot" << std::flush;
     }
     
     TerminalRenderer::cleanup();
