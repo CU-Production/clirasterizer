@@ -30,8 +30,6 @@
 
 #include "HandmadeMath.h"
 #include "parallel-util.hpp"
-#include <atomic>
-#include <memory>
 
 // ============================================================================
 // Platform-specific keyboard input
@@ -134,60 +132,39 @@ struct Color {
 };
 
 // ============================================================================
-// Framebuffer - stores color and depth for each pixel (thread-safe)
+// Framebuffer - stores color and depth for each pixel
 // ============================================================================
-
-// Helper: convert float to uint32 for atomic comparison (preserves order)
-inline uint32_t float_to_uint32(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, sizeof(u));
-    // Handle sign bit to preserve ordering: flip all bits for negative, flip sign bit for positive
-    if (u & 0x80000000) {
-        return ~u;  // Negative: flip all bits
-    } else {
-        return u ^ 0x80000000;  // Positive: flip sign bit
-    }
-}
 
 class Framebuffer {
 public:
     int width, height;
     std::vector<Color> color_buffer;
-    std::unique_ptr<std::atomic<uint32_t>[]> depth_buffer;  // Atomic array for thread-safe depth test
+    std::vector<float> depth_buffer;
     
     Framebuffer(int w, int h) : width(w), height(h) {
         color_buffer.resize(w * h);
-        depth_buffer = std::make_unique<std::atomic<uint32_t>[]>(w * h);
+        depth_buffer.resize(w * h);
         clear();
     }
     
     void clear() {
         Color bg_color(20, 20, 30);
-        uint32_t max_depth = float_to_uint32(std::numeric_limits<float>::max());
+        float max_depth = std::numeric_limits<float>::max();
         
         // Parallel clear for better performance
         parallelutil::parallel_for(width * height, [&](int i) {
             color_buffer[i] = bg_color;
-            depth_buffer[i].store(max_depth, std::memory_order_relaxed);
+            depth_buffer[i] = max_depth;
         });
     }
     
-    // Thread-safe pixel write with atomic depth test
+    // Simple pixel write with depth test (not thread-safe, use within single tile)
     void set_pixel(int x, int y, const Color& color, float depth) {
         if (x < 0 || x >= width || y < 0 || y >= height) return;
         int idx = y * width + x;
-        
-        uint32_t new_depth = float_to_uint32(depth);
-        uint32_t old_depth = depth_buffer[idx].load(std::memory_order_relaxed);
-        
-        // Atomic compare-and-swap loop for depth test
-        while (new_depth < old_depth) {
-            if (depth_buffer[idx].compare_exchange_weak(old_depth, new_depth,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                color_buffer[idx] = color;  // Won the race, write color
-                break;
-            }
-            // CAS failed, old_depth updated, retry if still closer
+        if (depth < depth_buffer[idx]) {
+            depth_buffer[idx] = depth;
+            color_buffer[idx] = color;
         }
     }
     
@@ -214,7 +191,7 @@ public:
         width = new_width;
         height = new_height;
         color_buffer.resize(width * height);
-        depth_buffer = std::make_unique<std::atomic<uint32_t>[]>(width * height);
+        depth_buffer.resize(width * height);
         clear();
     }
 };
@@ -390,8 +367,22 @@ public:
 };
 
 // ============================================================================
-// Rasterizer - software triangle rasterization
+// Rasterizer - software triangle rasterization with tile-based parallelism
 // ============================================================================
+
+// Tile size for parallel rendering
+constexpr int TILE_SIZE = 16;
+
+// Pre-processed triangle data in screen space
+struct ScreenTriangle {
+    std::array<HMM_Vec3, 3> screen_verts;  // Screen space positions
+    std::array<HMM_Vec4, 3> clip_verts;     // Original clip space (for perspective correction)
+    std::array<HMM_Vec2, 3> texcoords;
+    std::array<HMM_Vec3, 3> normals;
+    float area;
+    int min_x, max_x, min_y, max_y;  // Bounding box in pixels
+    bool valid;
+};
 
 class Rasterizer {
 public:
@@ -407,106 +398,186 @@ public:
         texture = tex;
     }
     
-    // Draw a triangle with interpolated attributes
-    void draw_triangle(
+    // Transform triangle to screen space and compute bounding box
+    ScreenTriangle prepare_triangle(
         const std::array<HMM_Vec4, 3>& clip_verts,
         const std::array<HMM_Vec2, 3>& texcoords,
         const std::array<HMM_Vec3, 3>& normals
-    ) {
+    ) const {
+        ScreenTriangle tri;
+        tri.clip_verts = clip_verts;
+        tri.texcoords = texcoords;
+        tri.normals = normals;
+        tri.valid = true;
+        
         // Convert to screen space
-        std::array<HMM_Vec3, 3> screen_verts;
         for (int i = 0; i < 3; i++) {
-            // Perspective division
             float w = clip_verts[i].W;
-            if (w <= 0.001f) return;  // Behind camera
+            if (w <= 0.001f) {
+                tri.valid = false;
+                return tri;
+            }
             
             float x = clip_verts[i].X / w;
             float y = clip_verts[i].Y / w;
             float z = clip_verts[i].Z / w;
             
-            // NDC to screen space
-            screen_verts[i].X = (x + 1.0f) * 0.5f * fb.width;
-            screen_verts[i].Y = (1.0f - y) * 0.5f * fb.height;  // Flip Y
-            screen_verts[i].Z = z;
+            tri.screen_verts[i].X = (x + 1.0f) * 0.5f * fb.width;
+            tri.screen_verts[i].Y = (1.0f - y) * 0.5f * fb.height;
+            tri.screen_verts[i].Z = z;
         }
         
         // Compute bounding box
-        float min_x = std::min({screen_verts[0].X, screen_verts[1].X, screen_verts[2].X});
-        float max_x = std::max({screen_verts[0].X, screen_verts[1].X, screen_verts[2].X});
-        float min_y = std::min({screen_verts[0].Y, screen_verts[1].Y, screen_verts[2].Y});
-        float max_y = std::max({screen_verts[0].Y, screen_verts[1].Y, screen_verts[2].Y});
+        float min_x = std::min({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X});
+        float max_x = std::max({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X});
+        float min_y = std::min({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y});
+        float max_y = std::max({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y});
         
-        int x0 = std::max(0, static_cast<int>(std::floor(min_x)));
-        int x1 = std::min(fb.width - 1, static_cast<int>(std::ceil(max_x)));
-        int y0 = std::max(0, static_cast<int>(std::floor(min_y)));
-        int y1 = std::min(fb.height - 1, static_cast<int>(std::ceil(max_y)));
+        tri.min_x = std::max(0, static_cast<int>(std::floor(min_x)));
+        tri.max_x = std::min(fb.width - 1, static_cast<int>(std::ceil(max_x)));
+        tri.min_y = std::max(0, static_cast<int>(std::floor(min_y)));
+        tri.max_y = std::min(fb.height - 1, static_cast<int>(std::ceil(max_y)));
         
-        // Edge function coefficients
+        // Compute area
+        auto edge = [](const HMM_Vec3& a, const HMM_Vec3& b, float px, float py) {
+            return (px - a.X) * (b.Y - a.Y) - (py - a.Y) * (b.X - a.X);
+        };
+        tri.area = edge(tri.screen_verts[0], tri.screen_verts[1], 
+                        tri.screen_verts[2].X, tri.screen_verts[2].Y);
+        
+        if (std::abs(tri.area) < 0.001f) {
+            tri.valid = false;
+        }
+        
+        return tri;
+    }
+    
+    // Rasterize a triangle within a specific tile region
+    void rasterize_triangle_in_tile(
+        const ScreenTriangle& tri,
+        int tile_x0, int tile_y0, int tile_x1, int tile_y1,
+        std::vector<Color>& tile_colors,
+        std::vector<float>& tile_depths,
+        int tile_width
+    ) const {
+        if (!tri.valid) return;
+        
+        // Check if triangle overlaps with tile
+        if (tri.max_x < tile_x0 || tri.min_x > tile_x1 ||
+            tri.max_y < tile_y0 || tri.min_y > tile_y1) {
+            return;
+        }
+        
+        // Clamp to tile bounds
+        int x0 = std::max(tri.min_x, tile_x0);
+        int x1 = std::min(tri.max_x, tile_x1);
+        int y0 = std::max(tri.min_y, tile_y0);
+        int y1 = std::min(tri.max_y, tile_y1);
+        
         auto edge = [](const HMM_Vec3& a, const HMM_Vec3& b, float px, float py) {
             return (px - a.X) * (b.Y - a.Y) - (py - a.Y) * (b.X - a.X);
         };
         
-        float area = edge(screen_verts[0], screen_verts[1], screen_verts[2].X, screen_verts[2].Y);
-        if (std::abs(area) < 0.001f) return;  // Degenerate triangle
+        float inv_area = 1.0f / tri.area;
         
-        // Rasterize
         for (int y = y0; y <= y1; y++) {
             for (int x = x0; x <= x1; x++) {
                 float px = x + 0.5f;
                 float py = y + 0.5f;
                 
-                float w0 = edge(screen_verts[1], screen_verts[2], px, py);
-                float w1 = edge(screen_verts[2], screen_verts[0], px, py);
-                float w2 = edge(screen_verts[0], screen_verts[1], px, py);
+                float w0 = edge(tri.screen_verts[1], tri.screen_verts[2], px, py);
+                float w1 = edge(tri.screen_verts[2], tri.screen_verts[0], px, py);
+                float w2 = edge(tri.screen_verts[0], tri.screen_verts[1], px, py);
                 
-                // Check if inside triangle (allow for both winding orders)
                 bool inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
                 if (!inside) continue;
                 
-                // Barycentric coordinates
-                float inv_area = 1.0f / area;
                 w0 *= inv_area;
                 w1 *= inv_area;
                 w2 *= inv_area;
                 
-                // Interpolate depth
-                float depth = w0 * screen_verts[0].Z + w1 * screen_verts[1].Z + w2 * screen_verts[2].Z;
-                
-                // Depth test
+                float depth = w0 * tri.screen_verts[0].Z + w1 * tri.screen_verts[1].Z + w2 * tri.screen_verts[2].Z;
                 if (depth < -1.0f || depth > 1.0f) continue;
                 
+                // Tile-local index
+                int local_x = x - tile_x0;
+                int local_y = y - tile_y0;
+                int local_idx = local_y * tile_width + local_x;
+                
+                // Depth test within tile (no atomics needed!)
+                if (depth >= tile_depths[local_idx]) continue;
+                tile_depths[local_idx] = depth;
+                
                 // Perspective-correct interpolation
-                float inv_w0 = 1.0f / clip_verts[0].W;
-                float inv_w1 = 1.0f / clip_verts[1].W;
-                float inv_w2 = 1.0f / clip_verts[2].W;
+                float inv_w0 = 1.0f / tri.clip_verts[0].W;
+                float inv_w1 = 1.0f / tri.clip_verts[1].W;
+                float inv_w2 = 1.0f / tri.clip_verts[2].W;
                 float inv_w = w0 * inv_w0 + w1 * inv_w1 + w2 * inv_w2;
                 float corr = 1.0f / inv_w;
                 
-                // Interpolate texcoords
                 HMM_Vec2 uv;
-                uv.X = (w0 * texcoords[0].X * inv_w0 + w1 * texcoords[1].X * inv_w1 + w2 * texcoords[2].X * inv_w2) * corr;
-                uv.Y = (w0 * texcoords[0].Y * inv_w0 + w1 * texcoords[1].Y * inv_w1 + w2 * texcoords[2].Y * inv_w2) * corr;
+                uv.X = (w0 * tri.texcoords[0].X * inv_w0 + w1 * tri.texcoords[1].X * inv_w1 + w2 * tri.texcoords[2].X * inv_w2) * corr;
+                uv.Y = (w0 * tri.texcoords[0].Y * inv_w0 + w1 * tri.texcoords[1].Y * inv_w1 + w2 * tri.texcoords[2].Y * inv_w2) * corr;
                 
-                // Interpolate normal
                 HMM_Vec3 normal;
-                normal.X = (w0 * normals[0].X * inv_w0 + w1 * normals[1].X * inv_w1 + w2 * normals[2].X * inv_w2) * corr;
-                normal.Y = (w0 * normals[0].Y * inv_w0 + w1 * normals[1].Y * inv_w1 + w2 * normals[2].Y * inv_w2) * corr;
-                normal.Z = (w0 * normals[0].Z * inv_w0 + w1 * normals[1].Z * inv_w1 + w2 * normals[2].Z * inv_w2) * corr;
+                normal.X = (w0 * tri.normals[0].X * inv_w0 + w1 * tri.normals[1].X * inv_w1 + w2 * tri.normals[2].X * inv_w2) * corr;
+                normal.Y = (w0 * tri.normals[0].Y * inv_w0 + w1 * tri.normals[1].Y * inv_w1 + w2 * tri.normals[2].Y * inv_w2) * corr;
+                normal.Z = (w0 * tri.normals[0].Z * inv_w0 + w1 * tri.normals[1].Z * inv_w1 + w2 * tri.normals[2].Z * inv_w2) * corr;
                 normal = HMM_NormV3(normal);
                 
-                // Sample texture
                 Color base_color = texture ? texture->sample(uv.X, uv.Y) : Color(200, 200, 200);
                 
-                // Simple diffuse lighting
                 float ndotl = std::max(0.0f, HMM_DotV3(normal, light_dir));
-                float ambient = 0.3f;
-                float diffuse = 0.7f * ndotl;
-                float lighting = ambient + diffuse;
+                float lighting = 0.3f + 0.7f * ndotl;
                 
-                Color final_color = base_color * lighting;
-                fb.set_pixel(x, y, final_color, depth);
+                tile_colors[local_idx] = base_color * lighting;
             }
         }
+    }
+    
+    // Render all triangles using tile-based parallelism
+    void render_tiled(const std::vector<ScreenTriangle>& triangles) {
+        int tiles_x = (fb.width + TILE_SIZE - 1) / TILE_SIZE;
+        int tiles_y = (fb.height + TILE_SIZE - 1) / TILE_SIZE;
+        int num_tiles = tiles_x * tiles_y;
+        
+        // Process tiles in parallel
+        parallelutil::parallel_for(num_tiles, [&](int tile_idx) {
+            int tile_col = tile_idx % tiles_x;
+            int tile_row = tile_idx / tiles_x;
+            
+            int tile_x0 = tile_col * TILE_SIZE;
+            int tile_y0 = tile_row * TILE_SIZE;
+            int tile_x1 = std::min(tile_x0 + TILE_SIZE - 1, fb.width - 1);
+            int tile_y1 = std::min(tile_y0 + TILE_SIZE - 1, fb.height - 1);
+            
+            int tile_width = tile_x1 - tile_x0 + 1;
+            int tile_height = tile_y1 - tile_y0 + 1;
+            int tile_size = tile_width * tile_height;
+            
+            // Local buffers for this tile
+            std::vector<Color> tile_colors(tile_size, Color(20, 20, 30));
+            std::vector<float> tile_depths(tile_size, std::numeric_limits<float>::max());
+            
+            // Rasterize all triangles into this tile
+            for (const auto& tri : triangles) {
+                rasterize_triangle_in_tile(tri, tile_x0, tile_y0, tile_x1, tile_y1,
+                                           tile_colors, tile_depths, tile_width);
+            }
+            
+            // Copy tile results to framebuffer (no race condition - tiles don't overlap)
+            for (int ly = 0; ly < tile_height; ly++) {
+                for (int lx = 0; lx < tile_width; lx++) {
+                    int gx = tile_x0 + lx;
+                    int gy = tile_y0 + ly;
+                    int local_idx = ly * tile_width + lx;
+                    int global_idx = gy * fb.width + gx;
+                    
+                    fb.color_buffer[global_idx] = tile_colors[local_idx];
+                    fb.depth_buffer[global_idx] = tile_depths[local_idx];
+                }
+            }
+        });
     }
 };
 
@@ -738,8 +809,7 @@ int main(int argc, char* argv[]) {
             std::cout << "\033[2J" << std::flush;
         }
         
-        // Clear framebuffer
-        fb.clear();
+        // Note: fb.clear() not needed - tile-based rendering initializes each tile
         
         // Build model matrix: center mesh and scale to unit size (no rotation - camera orbits instead)
         HMM_Mat4 model = HMM_M4D(1.0f);
@@ -755,8 +825,14 @@ int main(int argc, char* argv[]) {
         // Normal matrix (for lighting)
         HMM_Mat4 model_view = HMM_MulM4(view, model);
         
-        // Render all triangles in parallel
+        // ================================================================
+        // Tile-based parallel rendering
+        // ================================================================
+        
+        // Step 1: Transform all triangles to screen space (can be parallelized)
         int num_triangles = static_cast<int>(mesh.indices.size() / 3);
+        std::vector<ScreenTriangle> screen_triangles(num_triangles);
+        
         parallelutil::parallel_for(num_triangles, [&](int tri_idx) {
             size_t i = tri_idx * 3;
             std::array<HMM_Vec4, 3> clip_verts;
@@ -779,8 +855,11 @@ int main(int argc, char* argv[]) {
                 normals[j] = HMM_V3(transformed_n.X, transformed_n.Y, transformed_n.Z);
             }
             
-            rasterizer.draw_triangle(clip_verts, texcoords, normals);
+            screen_triangles[tri_idx] = rasterizer.prepare_triangle(clip_verts, texcoords, normals);
         });
+        
+        // Step 2: Render using tile-based parallelism (no atomics needed!)
+        rasterizer.render_tiled(screen_triangles);
         
         // Render to terminal
         TerminalRenderer::render(fb);
