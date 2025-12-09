@@ -38,6 +38,19 @@
 // Windows: use _kbhit() and _getch() from conio.h
 inline bool keyboard_hit() { return _kbhit() != 0; }
 inline int get_char() { return _getch(); }
+
+// Windows: Get terminal window size (columns, rows)
+inline void get_terminal_size(int& width, int& height) {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    } else {
+        width = 120;   // Default fallback
+        height = 30;
+    }
+}
 #else
 // Unix/Linux: implement non-blocking keyboard input
 inline bool keyboard_hit() {
@@ -64,14 +77,31 @@ inline bool keyboard_hit() {
     return false;
 }
 inline int get_char() { return getchar(); }
+
+// Unix/Linux: Get terminal window size (columns, rows)
+#include <sys/ioctl.h>
+inline void get_terminal_size(int& width, int& height) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        width = ws.ws_col;
+        height = ws.ws_row;
+    } else {
+        width = 120;   // Default fallback
+        height = 30;
+    }
+}
 #endif
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-constexpr int SCREEN_WIDTH = 120;
-constexpr int SCREEN_HEIGHT = 30;  // Actual pixel height = SCREEN_HEIGHT * 2
+// Default fallback resolution
+constexpr int DEFAULT_WIDTH = 120;
+constexpr int DEFAULT_HEIGHT = 30;
+
+// Reserve rows for status display at bottom
+constexpr int STATUS_ROWS = 3;
 
 // ============================================================================
 // Color structure
@@ -145,6 +175,16 @@ public:
         }
         int result = stbi_write_png(filename, width, height, 3, pixels.data(), width * 3);
         return result != 0;
+    }
+    
+    // Resize framebuffer to new dimensions
+    void resize(int new_width, int new_height) {
+        if (new_width == width && new_height == height) return;
+        width = new_width;
+        height = new_height;
+        color_buffer.resize(width * height);
+        depth_buffer.resize(width * height);
+        clear();
     }
 };
 
@@ -532,14 +572,28 @@ int main(int argc, char* argv[]) {
     float mesh_scale;
     mesh.get_bounds(mesh_center, mesh_scale);
     
-    // Create framebuffer (height * 2 for half-block characters)
-    Framebuffer fb(SCREEN_WIDTH, SCREEN_HEIGHT * 2);
+    // Get initial terminal size
+    int term_width, term_height;
+    get_terminal_size(term_width, term_height);
+    
+    // Calculate render dimensions
+    // term_height includes status rows, subtract them for actual render area
+    // Each character row represents 2 pixel rows (using half-block characters)
+    int screen_width = term_width;
+    int screen_height = std::max(1, term_height - STATUS_ROWS);  // Character rows for rendering
+    int pixel_height = screen_height * 2;  // Actual pixel height
+    
+    // Create framebuffer
+    Framebuffer fb(screen_width, pixel_height);
     Rasterizer rasterizer(fb);
     rasterizer.set_texture(&texture);
     
-    // Setup matrices
-    float aspect = static_cast<float>(SCREEN_WIDTH) / (SCREEN_HEIGHT * 2);
-    HMM_Mat4 projection = HMM_Perspective_RH_NO(HMM_AngleDeg(45.0f), aspect, 0.1f, 100.0f);
+    // Setup projection matrix (will be updated when terminal resizes)
+    auto update_projection = [](int w, int h) {
+        float aspect = static_cast<float>(w) / h;
+        return HMM_Perspective_RH_NO(HMM_AngleDeg(45.0f), aspect, 0.1f, 100.0f);
+    };
+    HMM_Mat4 projection = update_projection(screen_width, pixel_height);
     
     // ========================================================================
     // Third Person Camera Setup
@@ -600,6 +654,24 @@ int main(int argc, char* argv[]) {
         auto current_time = std::chrono::high_resolution_clock::now();
         float elapsed = std::chrono::duration<float>(current_time - start_time).count();
         (void)elapsed;  // Available for animations if needed
+        
+        // Check if terminal size changed
+        int new_term_width, new_term_height;
+        get_terminal_size(new_term_width, new_term_height);
+        
+        if (new_term_width != term_width || new_term_height != term_height) {
+            term_width = new_term_width;
+            term_height = new_term_height;
+            screen_width = term_width;
+            screen_height = std::max(1, term_height - STATUS_ROWS);
+            pixel_height = screen_height * 2;
+            
+            fb.resize(screen_width, pixel_height);
+            projection = update_projection(screen_width, pixel_height);
+            
+            // Clear screen to avoid artifacts
+            std::cout << "\033[2J" << std::flush;
+        }
         
         // Clear framebuffer
         fb.clear();
@@ -716,7 +788,7 @@ int main(int argc, char* argv[]) {
                     char filename[64];
                     snprintf(filename, sizeof(filename), "screenshot_%03d.png", screenshot_count++);
                     if (fb.save_to_file(filename)) {
-                        std::cout << "\033[" << (SCREEN_HEIGHT + 4) << ";1H";
+                        std::cout << "\033[" << (screen_height + 4) << ";1H";
                         std::cout << "\033[K";  // Clear line
                         std::cout << "Saved: " << filename << std::flush;
                     }
@@ -739,14 +811,14 @@ int main(int argc, char* argv[]) {
         }
         
         // Print status at bottom
-        std::cout << "\033[" << (SCREEN_HEIGHT + 2) << ";1H\033[K";
+        int status_row = screen_height + 2;
+        std::cout << "\033[" << status_row << ";1H\033[K";
         std::cout << "FPS: " << static_cast<int>(fps) 
-                  << "  Verts: " << mesh.vertices.size()
+                  << "  Res: " << screen_width << "x" << pixel_height
                   << std::fixed << std::setprecision(1)
-                  << "  Dist: " << camera.distance
-                  << "  Height: " << camera.target_height;
+                  << "  Dist: " << camera.distance;
         
-        std::cout << "\033[" << (SCREEN_HEIGHT + 3) << ";1H\033[K";
+        std::cout << "\033[" << (status_row + 1) << ";1H\033[K";
         std::cout << "[WASD] Orbit  [QE] Zoom  [ZX] Height  [R] Reset  [P] Screenshot" << std::flush;
     }
     
