@@ -408,21 +408,58 @@ public:
     }
     
     // Draw a triangle with interpolated attributes
+    // Includes frustum culling and backface culling for performance
     void draw_triangle(
         const std::array<HMM_Vec4, 3>& clip_verts,
         const std::array<HMM_Vec2, 3>& texcoords,
         const std::array<HMM_Vec3, 3>& normals
     ) {
-        // Convert to screen space
+        // ================================================================
+        // Frustum Culling in Clip Space (before perspective divide)
+        // ================================================================
+        
+        // Near plane culling: check if any vertex is behind camera
+        for (int i = 0; i < 3; i++) {
+            if (clip_verts[i].W <= 0.001f) return;  // Vertex behind camera
+        }
+        
+        // Frustum plane culling: check if all vertices are outside the same plane
+        // A vertex is outside if: coord > W (right/top/far) or coord < -W (left/bottom/near)
+        int all_left = 0, all_right = 0, all_bottom = 0, all_top = 0, all_near = 0, all_far = 0;
+        
+        for (int i = 0; i < 3; i++) {
+            float x = clip_verts[i].X;
+            float y = clip_verts[i].Y;
+            float z = clip_verts[i].Z;
+            float w = clip_verts[i].W;
+            
+            if (x < -w) all_left++;
+            if (x >  w) all_right++;
+            if (y < -w) all_bottom++;
+            if (y >  w) all_top++;
+            if (z < -w) all_near++;
+            if (z >  w) all_far++;
+        }
+        
+        // If all 3 vertices are outside the same frustum plane, cull the triangle
+        if (all_left == 3 || all_right == 3 || 
+            all_bottom == 3 || all_top == 3 ||
+            all_near == 3 || all_far == 3) {
+            return;
+        }
+        
+        // ================================================================
+        // Perspective Divide - Convert to Screen Space
+        // ================================================================
+        
         std::array<HMM_Vec3, 3> screen_verts;
         for (int i = 0; i < 3; i++) {
-            // Perspective division
             float w = clip_verts[i].W;
-            if (w <= 0.001f) return;  // Behind camera
+            float inv_w = 1.0f / w;
             
-            float x = clip_verts[i].X / w;
-            float y = clip_verts[i].Y / w;
-            float z = clip_verts[i].Z / w;
+            float x = clip_verts[i].X * inv_w;
+            float y = clip_verts[i].Y * inv_w;
+            float z = clip_verts[i].Z * inv_w;
             
             // NDC to screen space
             screen_verts[i].X = (x + 1.0f) * 0.5f * fb.width;
@@ -430,24 +467,46 @@ public:
             screen_verts[i].Z = z;
         }
         
+        // ================================================================
+        // Screen Space Culling
+        // ================================================================
+        
         // Compute bounding box
         float min_x = std::min({screen_verts[0].X, screen_verts[1].X, screen_verts[2].X});
         float max_x = std::max({screen_verts[0].X, screen_verts[1].X, screen_verts[2].X});
         float min_y = std::min({screen_verts[0].Y, screen_verts[1].Y, screen_verts[2].Y});
         float max_y = std::max({screen_verts[0].Y, screen_verts[1].Y, screen_verts[2].Y});
         
+        // Screen bounds culling - triangle completely outside screen
+        if (max_x < 0 || min_x >= fb.width || max_y < 0 || min_y >= fb.height) {
+            return;
+        }
+        
         int x0 = std::max(0, static_cast<int>(std::floor(min_x)));
         int x1 = std::min(fb.width - 1, static_cast<int>(std::ceil(max_x)));
         int y0 = std::max(0, static_cast<int>(std::floor(min_y)));
         int y1 = std::min(fb.height - 1, static_cast<int>(std::ceil(max_y)));
         
-        // Edge function coefficients
+        // Sub-pixel triangle culling
+        if (x0 > x1 || y0 > y1) return;
+        
+        // ================================================================
+        // Area and Backface Culling
+        // ================================================================
+        
+        // Edge function for barycentric coordinates
         auto edge = [](const HMM_Vec3& a, const HMM_Vec3& b, float px, float py) {
             return (px - a.X) * (b.Y - a.Y) - (py - a.Y) * (b.X - a.X);
         };
         
         float area = edge(screen_verts[0], screen_verts[1], screen_verts[2].X, screen_verts[2].Y);
-        if (std::abs(area) < 0.001f) return;  // Degenerate triangle
+        
+        // Degenerate triangle culling (zero area)
+        if (std::abs(area) < 0.001f) return;
+        
+        // Backface culling: positive area = clockwise winding = back face
+        // (In screen space with Y flipped, CCW triangles have negative area)
+        if (area < 0) return;
         
         // Rasterize
         for (int y = y0; y <= y1; y++) {
