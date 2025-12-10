@@ -30,8 +30,6 @@
 
 #include "HandmadeMath.h"
 #include "parallel-util.hpp"
-#include <mutex>
-#include <memory>
 
 // ============================================================================
 // Platform-specific keyboard input
@@ -369,14 +367,11 @@ public:
 };
 
 // ============================================================================
-// Rasterizer - Two-phase tile-based rendering (similar to PS5 NGGP)
+// Rasterizer - software triangle rasterization with tile-based parallelism
 // ============================================================================
-// Phase 1: Per-triangle parallel - Transform, cull, and bin triangles to tiles
-// Phase 2: Per-tile parallel - Rasterize only triangles assigned to each tile
 
 // Tile size for parallel rendering
 constexpr int TILE_SIZE = 16;
-constexpr int MAX_TRIANGLES_PER_TILE = 4096;  // Max triangles per tile
 
 // Pre-processed triangle data in screen space
 struct ScreenTriangle {
@@ -385,46 +380,8 @@ struct ScreenTriangle {
     std::array<HMM_Vec2, 3> texcoords;
     std::array<HMM_Vec3, 3> normals;
     float area;
-    float inv_area;
-    int min_tile_x, max_tile_x, min_tile_y, max_tile_y;  // Tile range
+    int min_x, max_x, min_y, max_y;  // Bounding box in pixels
     bool valid;
-};
-
-// Tile bin structure - stores triangle indices for each tile
-struct TileBin {
-    std::vector<uint32_t> triangle_indices;
-    std::unique_ptr<std::mutex> mutex;  // Pointer to avoid copy issues
-    
-    TileBin() : mutex(std::make_unique<std::mutex>()) {
-        triangle_indices.reserve(256);  // Pre-allocate
-    }
-    
-    // Move constructor
-    TileBin(TileBin&& other) noexcept 
-        : triangle_indices(std::move(other.triangle_indices))
-        , mutex(std::move(other.mutex)) {}
-    
-    // Move assignment
-    TileBin& operator=(TileBin&& other) noexcept {
-        triangle_indices = std::move(other.triangle_indices);
-        mutex = std::move(other.mutex);
-        return *this;
-    }
-    
-    // Delete copy operations
-    TileBin(const TileBin&) = delete;
-    TileBin& operator=(const TileBin&) = delete;
-    
-    void add_triangle(uint32_t idx) {
-        std::lock_guard<std::mutex> lock(*mutex);
-        if (triangle_indices.size() < MAX_TRIANGLES_PER_TILE) {
-            triangle_indices.push_back(idx);
-        }
-    }
-    
-    void clear() {
-        triangle_indices.clear();
-    }
 };
 
 class Rasterizer {
@@ -433,37 +390,16 @@ public:
     const Texture* texture = nullptr;
     HMM_Vec3 light_dir;
     
-    // Tile bins - persistent to avoid reallocation
-    std::vector<TileBin> tile_bins;
-    int tiles_x = 0, tiles_y = 0;
-    
     Rasterizer(Framebuffer& framebuffer) : fb(framebuffer) {
         light_dir = HMM_NormV3(HMM_V3(0.5f, 1.0f, 0.8f));
-        update_tile_bins();
     }
     
     void set_texture(const Texture* tex) {
         texture = tex;
     }
     
-    // Update tile bin structure when framebuffer size changes
-    void update_tile_bins() {
-        int new_tiles_x = (fb.width + TILE_SIZE - 1) / TILE_SIZE;
-        int new_tiles_y = (fb.height + TILE_SIZE - 1) / TILE_SIZE;
-        
-        if (new_tiles_x != tiles_x || new_tiles_y != tiles_y) {
-            tiles_x = new_tiles_x;
-            tiles_y = new_tiles_y;
-            tile_bins.resize(tiles_x * tiles_y);
-        }
-    }
-    
-    // ========================================================================
-    // Phase 1: Triangle Processing (per-triangle parallel)
-    // ========================================================================
-    
-    // Transform triangle to screen space, perform culling, compute tile range
-    ScreenTriangle process_triangle(
+    // Transform triangle to screen space and compute bounding box
+    ScreenTriangle prepare_triangle(
         const std::array<HMM_Vec4, 3>& clip_verts,
         const std::array<HMM_Vec2, 3>& texcoords,
         const std::array<HMM_Vec3, 3>& normals
@@ -472,92 +408,51 @@ public:
         tri.clip_verts = clip_verts;
         tri.texcoords = texcoords;
         tri.normals = normals;
-        tri.valid = false;
-        
-        // Frustum culling: check if all vertices are behind camera
-        bool all_behind = true;
-        for (int i = 0; i < 3; i++) {
-            if (clip_verts[i].W > 0.001f) all_behind = false;
-        }
-        if (all_behind) return tri;
+        tri.valid = true;
         
         // Convert to screen space
-        float min_x = std::numeric_limits<float>::max();
-        float max_x = std::numeric_limits<float>::lowest();
-        float min_y = std::numeric_limits<float>::max();
-        float max_y = std::numeric_limits<float>::lowest();
-        
         for (int i = 0; i < 3; i++) {
             float w = clip_verts[i].W;
-            if (w <= 0.001f) return tri;  // Vertex behind camera
+            if (w <= 0.001f) {
+                tri.valid = false;
+                return tri;
+            }
             
             float x = clip_verts[i].X / w;
             float y = clip_verts[i].Y / w;
             float z = clip_verts[i].Z / w;
             
-            // Note: Don't cull based on Z here - let per-pixel depth test handle it
-            
             tri.screen_verts[i].X = (x + 1.0f) * 0.5f * fb.width;
             tri.screen_verts[i].Y = (1.0f - y) * 0.5f * fb.height;
             tri.screen_verts[i].Z = z;
-            
-            min_x = std::min(min_x, tri.screen_verts[i].X);
-            max_x = std::max(max_x, tri.screen_verts[i].X);
-            min_y = std::min(min_y, tri.screen_verts[i].Y);
-            max_y = std::max(max_y, tri.screen_verts[i].Y);
         }
         
-        // Screen bounds culling
-        if (max_x < 0 || min_x >= fb.width || max_y < 0 || min_y >= fb.height) {
-            return tri;
-        }
+        // Compute bounding box
+        float min_x = std::min({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X});
+        float max_x = std::max({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X});
+        float min_y = std::min({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y});
+        float max_y = std::max({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y});
         
-        // Compute signed area (for backface culling and barycentric)
+        tri.min_x = std::max(0, static_cast<int>(std::floor(min_x)));
+        tri.max_x = std::min(fb.width - 1, static_cast<int>(std::ceil(max_x)));
+        tri.min_y = std::max(0, static_cast<int>(std::floor(min_y)));
+        tri.max_y = std::min(fb.height - 1, static_cast<int>(std::ceil(max_y)));
+        
+        // Compute area
         auto edge = [](const HMM_Vec3& a, const HMM_Vec3& b, float px, float py) {
             return (px - a.X) * (b.Y - a.Y) - (py - a.Y) * (b.X - a.X);
         };
         tri.area = edge(tri.screen_verts[0], tri.screen_verts[1], 
                         tri.screen_verts[2].X, tri.screen_verts[2].Y);
         
-        // Degenerate triangle culling (zero area)
-        if (std::abs(tri.area) < 0.001f) return tri;
+        if (std::abs(tri.area) < 0.001f) {
+            tri.valid = false;
+        }
         
-        // Small triangle culling (sub-pixel triangles)
-        float bbox_area = (max_x - min_x) * (max_y - min_y);
-        if (bbox_area < 0.5f) return tri;
-        
-        // Backface culling (optional, uncomment if needed)
-        // if (tri.area > 0) return tri;  // CW winding = backface
-        
-        tri.inv_area = 1.0f / tri.area;
-        
-        // Compute tile range
-        tri.min_tile_x = std::max(0, static_cast<int>(std::floor(min_x)) / TILE_SIZE);
-        tri.max_tile_x = std::min(tiles_x - 1, static_cast<int>(std::ceil(max_x)) / TILE_SIZE);
-        tri.min_tile_y = std::max(0, static_cast<int>(std::floor(min_y)) / TILE_SIZE);
-        tri.max_tile_y = std::min(tiles_y - 1, static_cast<int>(std::ceil(max_y)) / TILE_SIZE);
-        
-        tri.valid = true;
         return tri;
     }
     
-    // Bin a triangle to all tiles it overlaps
-    void bin_triangle(uint32_t tri_idx, const ScreenTriangle& tri) {
-        if (!tri.valid) return;
-        
-        for (int ty = tri.min_tile_y; ty <= tri.max_tile_y; ty++) {
-            for (int tx = tri.min_tile_x; tx <= tri.max_tile_x; tx++) {
-                int tile_idx = ty * tiles_x + tx;
-                tile_bins[tile_idx].add_triangle(tri_idx);
-            }
-        }
-    }
-    
-    // ========================================================================
-    // Phase 2: Tile Rasterization (per-tile parallel)
-    // ========================================================================
-    
-    // Rasterize a single triangle within tile bounds
+    // Rasterize a triangle within a specific tile region
     void rasterize_triangle_in_tile(
         const ScreenTriangle& tri,
         int tile_x0, int tile_y0, int tile_x1, int tile_y1,
@@ -565,22 +460,25 @@ public:
         std::vector<float>& tile_depths,
         int tile_width
     ) const {
-        // Clamp triangle bbox to tile bounds
-        int x0 = std::max(static_cast<int>(std::floor(std::min({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X}))), tile_x0);
-        int x1 = std::min(static_cast<int>(std::ceil(std::max({tri.screen_verts[0].X, tri.screen_verts[1].X, tri.screen_verts[2].X}))), tile_x1);
-        int y0 = std::max(static_cast<int>(std::floor(std::min({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y}))), tile_y0);
-        int y1 = std::min(static_cast<int>(std::ceil(std::max({tri.screen_verts[0].Y, tri.screen_verts[1].Y, tri.screen_verts[2].Y}))), tile_y1);
+        if (!tri.valid) return;
         
-        if (x0 > x1 || y0 > y1) return;
+        // Check if triangle overlaps with tile
+        if (tri.max_x < tile_x0 || tri.min_x > tile_x1 ||
+            tri.max_y < tile_y0 || tri.min_y > tile_y1) {
+            return;
+        }
+        
+        // Clamp to tile bounds
+        int x0 = std::max(tri.min_x, tile_x0);
+        int x1 = std::min(tri.max_x, tile_x1);
+        int y0 = std::max(tri.min_y, tile_y0);
+        int y1 = std::min(tri.max_y, tile_y1);
         
         auto edge = [](const HMM_Vec3& a, const HMM_Vec3& b, float px, float py) {
             return (px - a.X) * (b.Y - a.Y) - (py - a.Y) * (b.X - a.X);
         };
         
-        // Pre-compute perspective correction factors
-        float inv_w0 = 1.0f / tri.clip_verts[0].W;
-        float inv_w1 = 1.0f / tri.clip_verts[1].W;
-        float inv_w2 = 1.0f / tri.clip_verts[2].W;
+        float inv_area = 1.0f / tri.area;
         
         for (int y = y0; y <= y1; y++) {
             for (int x = x0; x <= x1; x++) {
@@ -591,24 +489,29 @@ public:
                 float w1 = edge(tri.screen_verts[2], tri.screen_verts[0], px, py);
                 float w2 = edge(tri.screen_verts[0], tri.screen_verts[1], px, py);
                 
-                // Inside test (handles both winding orders)
                 bool inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
                 if (!inside) continue;
                 
-                w0 *= tri.inv_area;
-                w1 *= tri.inv_area;
-                w2 *= tri.inv_area;
+                w0 *= inv_area;
+                w1 *= inv_area;
+                w2 *= inv_area;
                 
                 float depth = w0 * tri.screen_verts[0].Z + w1 * tri.screen_verts[1].Z + w2 * tri.screen_verts[2].Z;
+                if (depth < -1.0f || depth > 1.0f) continue;
                 
                 // Tile-local index
-                int local_idx = (y - tile_y0) * tile_width + (x - tile_x0);
+                int local_x = x - tile_x0;
+                int local_y = y - tile_y0;
+                int local_idx = local_y * tile_width + local_x;
                 
-                // Depth test
+                // Depth test within tile (no atomics needed!)
                 if (depth >= tile_depths[local_idx]) continue;
                 tile_depths[local_idx] = depth;
                 
                 // Perspective-correct interpolation
+                float inv_w0 = 1.0f / tri.clip_verts[0].W;
+                float inv_w1 = 1.0f / tri.clip_verts[1].W;
+                float inv_w2 = 1.0f / tri.clip_verts[2].W;
                 float inv_w = w0 * inv_w0 + w1 * inv_w1 + w2 * inv_w2;
                 float corr = 1.0f / inv_w;
                 
@@ -632,26 +535,13 @@ public:
         }
     }
     
-    // ========================================================================
-    // Main render function - Two-phase pipeline
-    // ========================================================================
-    
-    void render_two_phase(const std::vector<ScreenTriangle>& triangles) {
-        update_tile_bins();
+    // Render all triangles using tile-based parallelism
+    void render_tiled(const std::vector<ScreenTriangle>& triangles) {
+        int tiles_x = (fb.width + TILE_SIZE - 1) / TILE_SIZE;
+        int tiles_y = (fb.height + TILE_SIZE - 1) / TILE_SIZE;
         int num_tiles = tiles_x * tiles_y;
         
-        // Clear all tile bins
-        parallelutil::parallel_for(num_tiles, [&](int i) {
-            tile_bins[i].clear();
-        });
-        
-        // Phase 1: Bin triangles to tiles (per-triangle parallel)
-        int num_triangles = static_cast<int>(triangles.size());
-        parallelutil::parallel_for(num_triangles, [&](int tri_idx) {
-            bin_triangle(static_cast<uint32_t>(tri_idx), triangles[tri_idx]);
-        });
-        
-        // Phase 2: Rasterize tiles (per-tile parallel)
+        // Process tiles in parallel
         parallelutil::parallel_for(num_tiles, [&](int tile_idx) {
             int tile_col = tile_idx % tiles_x;
             int tile_row = tile_idx / tiles_x;
@@ -663,32 +553,29 @@ public:
             
             int tile_width = tile_x1 - tile_x0 + 1;
             int tile_height = tile_y1 - tile_y0 + 1;
-            int tile_pixel_count = tile_width * tile_height;
+            int tile_size = tile_width * tile_height;
             
-            // Local tile buffers
-            std::vector<Color> tile_colors(tile_pixel_count, Color(20, 20, 30));
-            std::vector<float> tile_depths(tile_pixel_count, std::numeric_limits<float>::max());
+            // Local buffers for this tile
+            std::vector<Color> tile_colors(tile_size, Color(20, 20, 30));
+            std::vector<float> tile_depths(tile_size, std::numeric_limits<float>::max());
             
-            // Rasterize only triangles assigned to this tile
-            const auto& bin = tile_bins[tile_idx];
-            for (uint32_t tri_idx : bin.triangle_indices) {
-                rasterize_triangle_in_tile(triangles[tri_idx], 
-                                           tile_x0, tile_y0, tile_x1, tile_y1,
+            // Rasterize all triangles into this tile
+            for (const auto& tri : triangles) {
+                rasterize_triangle_in_tile(tri, tile_x0, tile_y0, tile_x1, tile_y1,
                                            tile_colors, tile_depths, tile_width);
             }
             
-            // Copy results to global framebuffer
+            // Copy tile results to framebuffer (no race condition - tiles don't overlap)
             for (int ly = 0; ly < tile_height; ly++) {
-                int gy = tile_y0 + ly;
-                int local_row_start = ly * tile_width;
-                int global_row_start = gy * fb.width + tile_x0;
-                
-                std::memcpy(&fb.color_buffer[global_row_start], 
-                           &tile_colors[local_row_start], 
-                           tile_width * sizeof(Color));
-                std::memcpy(&fb.depth_buffer[global_row_start], 
-                           &tile_depths[local_row_start], 
-                           tile_width * sizeof(float));
+                for (int lx = 0; lx < tile_width; lx++) {
+                    int gx = tile_x0 + lx;
+                    int gy = tile_y0 + ly;
+                    int local_idx = ly * tile_width + lx;
+                    int global_idx = gy * fb.width + gx;
+                    
+                    fb.color_buffer[global_idx] = tile_colors[local_idx];
+                    fb.depth_buffer[global_idx] = tile_depths[local_idx];
+                }
             }
         });
     }
@@ -939,18 +826,13 @@ int main(int argc, char* argv[]) {
         HMM_Mat4 model_view = HMM_MulM4(view, model);
         
         // ================================================================
-        // Two-phase tile-based rendering (PS5 NGGP style)
+        // Tile-based parallel rendering
         // ================================================================
-        // Phase 1: Per-triangle parallel - Transform, cull, and bin to tiles
-        // Phase 2: Per-tile parallel - Rasterize only assigned triangles
         
-        // Update tile structure before processing (needed for tile range calculation)
-        rasterizer.update_tile_bins();
-        
+        // Step 1: Transform all triangles to screen space (can be parallelized)
         int num_triangles = static_cast<int>(mesh.indices.size() / 3);
         std::vector<ScreenTriangle> screen_triangles(num_triangles);
         
-        // Phase 1a: Transform and cull triangles (per-triangle parallel)
         parallelutil::parallel_for(num_triangles, [&](int tri_idx) {
             size_t i = tri_idx * 3;
             std::array<HMM_Vec4, 3> clip_verts;
@@ -973,12 +855,11 @@ int main(int argc, char* argv[]) {
                 normals[j] = HMM_V3(transformed_n.X, transformed_n.Y, transformed_n.Z);
             }
             
-            // Process triangle: transform, cull, compute tile range
-            screen_triangles[tri_idx] = rasterizer.process_triangle(clip_verts, texcoords, normals);
+            screen_triangles[tri_idx] = rasterizer.prepare_triangle(clip_verts, texcoords, normals);
         });
         
-        // Phase 1b + Phase 2: Bin triangles to tiles, then rasterize per-tile
-        rasterizer.render_two_phase(screen_triangles);
+        // Step 2: Render using tile-based parallelism (no atomics needed!)
+        rasterizer.render_tiled(screen_triangles);
         
         // Render to terminal
         TerminalRenderer::render(fb);
