@@ -107,20 +107,22 @@ constexpr int DEFAULT_HEIGHT = 30;
 constexpr int STATUS_ROWS = 3;
 
 // ============================================================================
-// Color structure
+// Color structure (with alpha channel support)
 // ============================================================================
 
 struct Color {
-    uint8_t r, g, b;
+    uint8_t r, g, b, a;
     
-    Color() : r(0), g(0), b(0) {}
-    Color(uint8_t r, uint8_t g, uint8_t b) : r(r), g(g), b(b) {}
+    Color() : r(0), g(0), b(0), a(255) {}
+    Color(uint8_t r, uint8_t g, uint8_t b) : r(r), g(g), b(b), a(255) {}
+    Color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) : r(r), g(g), b(b), a(a) {}
     
     Color operator*(float f) const {
         return Color(
             static_cast<uint8_t>(std::clamp(r * f, 0.0f, 255.0f)),
             static_cast<uint8_t>(std::clamp(g * f, 0.0f, 255.0f)),
-            static_cast<uint8_t>(std::clamp(b * f, 0.0f, 255.0f))
+            static_cast<uint8_t>(std::clamp(b * f, 0.0f, 255.0f)),
+            a  // Alpha unchanged by lighting
         );
     }
     
@@ -128,8 +130,14 @@ struct Color {
         return Color(
             static_cast<uint8_t>(std::clamp(r + other.r, 0, 255)),
             static_cast<uint8_t>(std::clamp(g + other.g, 0, 255)),
-            static_cast<uint8_t>(std::clamp(b + other.b, 0, 255))
+            static_cast<uint8_t>(std::clamp(b + other.b, 0, 255)),
+            static_cast<uint8_t>(std::clamp(a + other.a, 0, 255))
         );
+    }
+    
+    // Check if pixel should be clipped (alpha test)
+    bool should_clip(float threshold = 0.1f) const {
+        return (a / 255.0f) < threshold;
     }
 };
 
@@ -220,7 +228,7 @@ public:
 };
 
 // ============================================================================
-// Texture - loads and samples image textures
+// Texture - loads and samples image textures (with alpha channel support)
 // ============================================================================
 
 class Texture {
@@ -228,21 +236,26 @@ public:
     int width = 0, height = 0, channels = 0;
     std::vector<uint8_t> data;
     bool loaded = false;
+    bool has_alpha = false;
     
     bool load(const char* filename) {
-        uint8_t* img_data = stbi_load(filename, &width, &height, &channels, 3);
+        // Load with 4 channels (RGBA) to support alpha
+        uint8_t* img_data = stbi_load(filename, &width, &height, &channels, 4);
         if (!img_data) {
             std::cerr << "Failed to load texture: " << filename << std::endl;
             return false;
         }
-        data.assign(img_data, img_data + width * height * 3);
+        has_alpha = (channels == 4);
+        data.assign(img_data, img_data + width * height * 4);
         stbi_image_free(img_data);
         loaded = true;
+        std::cout << "Loaded texture: " << width << "x" << height 
+                  << " (alpha: " << (has_alpha ? "yes" : "no") << ")" << std::endl;
         return true;
     }
     
     Color sample(float u, float v) const {
-        if (!loaded) return Color(200, 200, 200);
+        if (!loaded) return Color(200, 200, 200, 255);
         
         // Wrap UV coordinates
         u = u - std::floor(u);
@@ -254,8 +267,8 @@ public:
         x = std::clamp(x, 0, width - 1);
         y = std::clamp(y, 0, height - 1);
         
-        int idx = (y * width + x) * 3;
-        return Color(data[idx], data[idx + 1], data[idx + 2]);
+        int idx = (y * width + x) * 4;
+        return Color(data[idx], data[idx + 1], data[idx + 2], data[idx + 3]);
     }
 };
 
@@ -554,7 +567,10 @@ public:
                 normal = HMM_NormV3(normal);
                 
                 // Sample texture
-                Color base_color = texture ? texture->sample(uv.X, uv.Y) : Color(200, 200, 200);
+                Color base_color = texture ? texture->sample(uv.X, uv.Y) : Color(200, 200, 200, 255);
+                
+                // Alpha clip: skip pixels with alpha < 0.1 (alpha test)
+                if (base_color.should_clip(0.1f)) continue;
                 
                 // Simple diffuse lighting
                 float ndotl = std::max(0.0f, HMM_DotV3(normal, light_dir));
